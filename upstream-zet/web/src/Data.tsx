@@ -1,0 +1,200 @@
+export type ShapeId = string;
+export type RouteId = number;
+
+export interface Stops {
+  lats: number[];
+  lons: number[];
+}
+
+export interface Shape {
+  id: ShapeId;
+  lats: number[];
+  lons: number[];
+  stops: Stops;
+}
+
+export interface BigStaticData {
+  shapes: { [key: ShapeId]: Shape };
+}
+
+export interface SmallStaticData {
+  routeIds: RouteId[];
+}
+
+interface CompressedShapes {
+  ids: ShapeId[];
+  compressedLats: number[][];
+  compressedLons: number[][];
+  stopIndexDeltas: number[][];
+}
+
+interface CompressedRoutes {
+  ids: RouteId[];
+}
+
+export interface CompressedBigStaticData {
+  shapes: CompressedShapes;
+  stops: {
+    latDeltas: number[];
+    lonDeltas: number[];
+  };
+}
+
+export interface CompressedSmallStaticData {
+  routes: CompressedRoutes;
+}
+
+export interface Vehicle {
+  vehicleId: string | null;
+  tripId: string | null;
+  blockId: string | null;
+  routeId: RouteId;
+  shapeId: ShapeId;
+  lat: number[];
+  lon: number[];
+  /** Unix timestamp (seconds) of the vehicle's last reported position. */
+  timestamp: number;
+  /** Timestamp is missing/invalid, or more than 3 seconds ahead of feed time. */
+  hasInvalidTimestamp: boolean;
+  /** Estimated delivery delay relative to feed time, in seconds. At startup or
+   * after a gap, conservatively uses position age. Null for invalid timestamps
+   * or older servers. */
+  reportDelay: number | null;
+  directionDegrees: number | null;
+}
+
+export interface RealTimeState {
+  vehicles: Vehicle[];
+  timestamp: number;
+  activeStaticKey: string;
+}
+
+export interface CompressedVehicles {
+  vehicleIds: (string | null)[];
+  tripIds: (string | null)[];
+  blockIds: (string | null)[];
+  routeIds: RouteId[];
+  shapeIds: ShapeId[];
+  /** Seconds before the feed timestamp. */
+  timestamps: number[];
+  /** Missing from older servers. */
+  reportDelays?: (number | null)[];
+  compressedLats: number[][];
+  compressedLons: number[][];
+  directionDegrees: number[];
+}
+
+export interface CompressedRealTimeState {
+  vehicles: CompressedVehicles;
+  timestamp: number;
+  activeStaticKey: string;
+}
+
+class StaticReferenceSystem {
+  coord_num_digits: number;
+  ref_lat: number;
+  ref_lon: number;
+
+  constructor(coord_num_digits: number, ref_lat: number, ref_lon: number) {
+    this.coord_num_digits = coord_num_digits;
+    this.ref_lat = ref_lat;
+    this.ref_lon = ref_lon;
+  }
+
+  _decompress_coords(ref_value: number, coords: number[]): number[] {
+    const inv_scale = Math.pow(10, -this.coord_num_digits);
+    return decodeDeltas(coords).map((offset) => ref_value + offset * inv_scale);
+  }
+
+  decompress_lats(lats: number[]): number[] {
+    return this._decompress_coords(this.ref_lat, lats);
+  }
+
+  decompress_lons(lons: number[]): number[] {
+    return this._decompress_coords(this.ref_lon, lons);
+  }
+}
+
+const STATIC_REFERENCE_SYSTEM = new StaticReferenceSystem(6, 45.815, 15.9819);
+
+const FUTURE_TIMESTAMP_TOLERANCE_SECONDS = 3;
+
+function decompressVehicles(
+  data: CompressedVehicles,
+  refTimestamp: number,
+): Vehicle[] {
+  const vehicles: Vehicle[] = [];
+  for (let i = 0, n = data.routeIds.length; i < n; ++i) {
+    const timestamp = refTimestamp - data.timestamps[i];
+    vehicles.push({
+      vehicleId: data.vehicleIds[i],
+      tripId: data.tripIds[i],
+      blockId: data.blockIds[i],
+      routeId: data.routeIds[i],
+      shapeId: data.shapeIds[i],
+      lat: STATIC_REFERENCE_SYSTEM.decompress_lats(data.compressedLats[i]),
+      lon: STATIC_REFERENCE_SYSTEM.decompress_lons(data.compressedLons[i]),
+      timestamp,
+      hasInvalidTimestamp:
+        !Number.isFinite(timestamp) ||
+        timestamp <= 0 ||
+        data.timestamps[i] < -FUTURE_TIMESTAMP_TOLERANCE_SECONDS,
+      reportDelay: data.reportDelays?.[i] ?? null,
+      directionDegrees: data.directionDegrees[i],
+    });
+  }
+  return vehicles;
+}
+
+export function decompressRealTimeState(
+  data: CompressedRealTimeState,
+): RealTimeState {
+  return {
+    vehicles: decompressVehicles(data.vehicles, data.timestamp),
+    timestamp: data.timestamp,
+    activeStaticKey: data.activeStaticKey,
+  };
+}
+
+function decodeDeltas(deltas: number[]): number[] {
+  let value = 0;
+  return deltas.map((delta) => (value += delta));
+}
+
+export function decompressBigStaticData(
+  data: CompressedBigStaticData,
+): BigStaticData {
+  const stopLats = STATIC_REFERENCE_SYSTEM.decompress_lats(
+    data.stops.latDeltas,
+  );
+  const stopLons = STATIC_REFERENCE_SYSTEM.decompress_lons(
+    data.stops.lonDeltas,
+  );
+  const shapes: { [key: ShapeId]: Shape } = {};
+  for (let i = 0, n = data.shapes.ids.length; i < n; ++i) {
+    const shapeId = data.shapes.ids[i];
+    const stopIndices = decodeDeltas(data.shapes.stopIndexDeltas[i]);
+    shapes[shapeId] = {
+      id: shapeId,
+      stops: {
+        lats: stopIndices.map((index) => stopLats[index]),
+        lons: stopIndices.map((index) => stopLons[index]),
+      },
+      lats: STATIC_REFERENCE_SYSTEM.decompress_lats(
+        data.shapes.compressedLats[i],
+      ),
+      lons: STATIC_REFERENCE_SYSTEM.decompress_lons(
+        data.shapes.compressedLons[i],
+      ),
+    };
+  }
+  return { shapes };
+}
+
+export function decompressSmallStaticData(
+  data: CompressedSmallStaticData,
+): SmallStaticData {
+  return {
+    routeIds: data.routes.ids,
+  };
+}

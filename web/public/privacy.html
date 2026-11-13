@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="hr">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Pravila privatnosti – ZET uživo</title>
+    <style>
+      body {
+        font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+        line-height: 1.5;
+        max-width: 46rem;
+        margin: 2rem auto;
+        padding: 0 1rem;
+        color: #222;
+      }
+      h1 { font-size: 1.4rem; }
+      a { color: #0a58ca; }
+      .stamp { font-size: 0.9rem; color: #666; }
+    </style>
+  </head>
+  <body>
+    <p class="lang">
+      <a href="#" id="show-hr">HR</a>
+      ·
+      <a href="#" id="show-en">EN</a>
+    </p>
+    <article id="hr">
+    <h1>Pravila privatnosti – ZET uživo</h1>
+
+    <p>
+      ZET uživo je neslužbena aplikacija koja prikazuje položaje ZET tramvaja i
+      autobusa. Ova stranica ne koristi kolačiće niti tehnologije za praćenje
+      korisnika i ne šalje podatke o korisnicima nikome.
+    </p>
+
+    <h2>Što aplikacija pohranjuje na vašem uređaju</h2>
+    <p>
+      U lokalnoj pohrani preglednika (localStorage) aplikacija čuva isključivo
+      vlastite postavke:
+    </p>
+    <ul>
+      <li>odabrane linije i uključenost filtra (<code>vozlinija-filter-state</code>),</li>
+      <li>omiljene stanice (<code>vozlinija-favorites</code>),</li>
+      <li>jezik i temu (<code>vozlinija-lang</code>, <code>vozlinija-theme</code>),</li>
+      <li>verziju posljednje pročitanih ZET obavijesti (<code>vozlinija-news-seen-version-v1</code>),</li>
+      <li>postavku praćenja geolokacije (<code>vozlinija-location-tracking-enabled</code>).</li>
+    </ul>
+    <p>Ništa od toga ne napušta vaš uređaj.</p>
+
+    <h2>Što aplikacija prikuplja</h2>
+    <p>
+      Ništa. Obrazac za povratne informacije je onemogućen (stub): poruke se ne
+      šalju niti pohranjuju. Aplikacija ne koristi analitiku ni oglašivačke
+      usluge.
+    </p>
+
+    <h2>Usluge trećih strana</h2>
+    <p>
+      Aplikacija prikazuje podatke javne vlasti koje objavljuje ZET
+      (www.zet.hr): statične podatke u GTFS formatu i GTFS-Realtime protokol.
+      Kartografske podloge učitavaju se s OpenFreeMap (tiles.openfreemap.org),
+      čija pravila privatnosti su dostupna na
+      <a href="https://openfreemap.org/privacy">openfreemap.org/privacy</a>.
+      Poslužitelji tih usluga vođenjem vlastitih zapisa mogu prikupljati IP
+      adrese prema svojim pravilima privatnosti; ZET uživo na to ne utječe.
+    </p>
+    <p class="stamp">Zadnja promjena: 13. studenoga 2026.</p>
+    </article>
+
+    <article id="en" hidden>
+    <h1>Privacy – ZET uživo</h1>
+    <p>
+      ZET uživo is an unofficial app that shows ZET tram and bus positions.
+      This site does not use cookies or tracking, and it does not send data
+      about you to anyone.
+    </p>
+    <h2>What stays on your device</h2>
+    <p>The app only stores its own settings in the browser (localStorage):</p>
+    <ul>
+      <li>chosen lines and whether the filter is on (<code>vozlinija-filter-state</code>),</li>
+      <li>favourite stops (<code>vozlinija-favorites</code>),</li>
+      <li>language and theme (<code>vozlinija-lang</code>, <code>vozlinija-theme</code>),</li>
+      <li>the last news version you opened (<code>vozlinija-news-seen-version-v1</code>),</li>
+      <li>whether location tracking is on (<code>vozlinija-location-tracking-enabled</code>).</li>
+    </ul>
+    <p>None of that leaves your device.</p>
+    <h2>What the app collects</h2>
+    <p>
+      Nothing. The feedback form is disabled: messages are neither sent nor
+      stored. There is no analytics and no advertising.
+    </p>
+    <h2>Third-party services</h2>
+    <p>
+      The app shows public data published by ZET (www.zet.hr): a static GTFS
+      timetable and a GTFS-Realtime feed. Map tiles come from OpenFreeMap
+      (tiles.openfreemap.org); their privacy policy is at
+      <a href="https://openfreemap.org/privacy">openfreemap.org/privacy</a>.
+      Those services may log IP addresses under their own policies. ZET uživo
+      does not control that.
+    </p>
+    <p class="stamp">Last updated: 13 November 2026.</p>
+    </article>
+    <script>
+      function show(lang) {
+        document.getElementById("hr").hidden = lang !== "hr";
+        document.getElementById("en").hidden = lang !== "en";
+        document.documentElement.lang = lang;
+        try { localStorage.setItem("vozlinija-lang", lang); } catch (e) {}
+      }
+      document.getElementById("show-hr").onclick = function (e) { e.preventDefault(); show("hr"); };
+      document.getElementById("show-en").onclick = function (e) { e.preventDefault(); show("en"); };
+      try { if (localStorage.getItem("vozlinija-lang") === "en") show("en"); } catch (e) {}
+    </script>
+  </body>
+</html>

@@ -1,0 +1,8 @@
+services:
+  zet:
+    build: .
+    container_name: zet-uzivo
+    ports:
+      # 5000 is AirPlay on macOS. 8080 is often already taken too.
+      - "8787:5000"
+    restart: unless-stopped

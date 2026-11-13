@@ -1,0 +1,1028 @@
+from collections.abc import Callable, Iterable, Iterator
+from dataclasses import dataclass, field
+from itertools import groupby
+from typing import Optional
+from zoneinfo import ZoneInfo
+import argparse
+import asyncio
+import csv
+import datetime
+import gzip
+import hashlib
+import io
+import json
+import logging
+import math
+import os
+import random
+import threading
+import time
+import zipfile
+
+from flask import Flask, Response, jsonify, request
+from flask_cors import CORS
+from flask_sock import Sock
+from google.protobuf.json_format import MessageToDict
+from google.transit import gtfs_realtime_pb2
+import simple_websocket
+import websockets
+
+import zet.math.latlon as latlon
+from zet.webserver.news import (
+    NEWS_FETCH_INTERVAL_SECONDS,
+    NEWS_SCHEMA_V1,
+    NEWS_SCHEMA_V2,
+    NewsCache,
+)
+from zet.webserver.frontend_release import release_message
+from zet.utils.email import send_feedback_email
+from zet.utils.pushover import RateLimitedNotifier
+
+MAX_TRAJECTORY_LENGTH = 30
+# Longer observation gaps cannot distinguish late delivery from a stopped vehicle.
+MAX_REPORT_OBSERVATION_GAP_SECONDS = 30
+STALE_THRESHOLD = 120  # seconds
+TRAJECTORY_OUTPUT_LENGTH = 6
+DIRECTION_THRESHOLD_METERS = 20
+
+TripId = str
+ShapeId = str
+RouteId = int
+
+app = Flask(__name__, static_folder='../static')
+if os.environ.get('ZET_DEV') == '1':
+    CORS(app, origins=['http://localhost:3000'])
+sock = Sock(app)
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+@dataclass
+class StaticReferenceSystem:
+    coord_num_digits: int
+    ref_lat: float
+    ref_lon: float
+
+    def _compress_coord(self, ref_value: float, values: list[float]) -> list[int]:
+        factor = 10 ** self.coord_num_digits
+        # Round absolute offsets before differencing. Rounding each step would
+        # accumulate error, especially for negative coordinate changes.
+        return _encode_deltas(round((v - ref_value) * factor) for v in values)
+
+    def compress_lats(self, lat: list[float]) -> list[int]:
+        return self._compress_coord(self.ref_lat, lat)
+
+    def compress_lons(self, lon: list[float]) -> list[int]:
+        return self._compress_coord(self.ref_lon, lon)
+
+
+@dataclass
+class ReferenceSystem:
+    static: StaticReferenceSystem
+    ref_timestamp: int
+
+    def compress_timestamps(self, timestamps: list[int]) -> list[int]:
+        return [self.ref_timestamp - t for t in timestamps]
+
+
+STATIC_REFERENCE_SYSTEM = StaticReferenceSystem(
+    coord_num_digits=6,
+    ref_lat=45.815,
+    ref_lon=15.9819,
+)
+
+@dataclass
+class ParsedVehicle:
+    route_id: int
+    trip_id: TripId
+    timestamp: int
+    lat: float
+    lon: float
+    vehicle_id: str | None = None
+
+
+@dataclass
+class ParsedFeed:
+    vehicles: list[ParsedVehicle]
+    timestamp: int
+
+    @staticmethod
+    def from_raw_feed(
+        raw_feed: gtfs_realtime_pb2.FeedMessage,
+    ) -> Optional['ParsedFeed']:
+        feed = MessageToDict(raw_feed)
+        if not isinstance(feed, dict):
+            return None
+
+        vehicles: list[ParsedVehicle]  = []
+        for entity in feed.get('entity', []):
+            if 'vehicle' in entity:
+                vehicle = ParsedFeed._parse_vehicle(entity['vehicle'])
+                if vehicle is not None:
+                    vehicles.append(vehicle)
+
+        timestamp = int(feed['header']['timestamp'])
+        return ParsedFeed(vehicles=vehicles, timestamp=timestamp)
+
+    @staticmethod
+    def _parse_vehicle(vehicle: dict) -> ParsedVehicle | None:
+        try:
+            return ParsedVehicle(
+                route_id=int(vehicle['trip']['routeId']),
+                trip_id=vehicle['trip']['tripId'],
+                timestamp=int(vehicle['timestamp']),
+                lat=vehicle['position']['latitude'],
+                lon=vehicle['position']['longitude'],
+                vehicle_id=vehicle.get('vehicle', {}).get('id') or None,
+            )
+        except (KeyError, ValueError) as e:
+            logger.error(f"Error parsing vehicle: {e}")
+            return None
+
+
+@dataclass
+class Vehicle:
+    route_id: int
+    shape_id: ShapeId | None
+    timestamp: int
+    lat: list[float]  # lat[-1] is the newest position
+    lon: list[float]  # lon[-1] is the newest position
+    direction_radians: float | None = None
+
+    # How many times did the feed not contain the vehicle.
+    no_update_counter: int = 0
+    # Estimated delay relative to the feed timestamp. At startup or after a
+    # gap, conservatively use position age. During continuous observation,
+    # repeated timestamps retain the estimate because the vehicle may be stopped.
+    report_delay: int | None = None
+    vehicle_id: str | None = None
+    trip_id: TripId | None = None
+    block_id: str | None = None
+
+    @staticmethod
+    def from_parsed_vehicle(
+        vehicle: ParsedVehicle,
+        static_data: Optional['StaticData'],
+    ) -> 'Vehicle':
+        """Create a vehicle from a parsed vehicle.
+
+        The update() method must be called to add the first position."""
+        if static_data:
+            shape_id = static_data.trip_to_shape_id.get(vehicle.trip_id)
+        else:
+            shape_id = None
+        return Vehicle(
+            route_id=vehicle.route_id,
+            shape_id=shape_id,
+            timestamp=vehicle.timestamp,
+            lat=[],
+            lon=[],
+            vehicle_id=vehicle.vehicle_id,
+            trip_id=vehicle.trip_id,
+            block_id=(static_data.trip_to_block_id.get(vehicle.trip_id)
+                      if static_data else None))
+
+    def update(self,
+               vehicle: ParsedVehicle,
+               static_data: Optional['StaticData'],
+               feed_timestamp: int,
+               continuous_feed: bool):
+        if (not continuous_feed or self.no_update_counter != 1
+                or vehicle.timestamp != self.timestamp
+                or self.report_delay is None):
+            self.report_delay = (
+                feed_timestamp - vehicle.timestamp
+                if 0 < vehicle.timestamp <= feed_timestamp else None)
+        self.lat.append(vehicle.lat)
+        self.lon.append(vehicle.lon)
+        if len(self.lat) > MAX_TRAJECTORY_LENGTH:
+            self.lat.pop(0)  # Remove the oldest position.
+            self.lon.pop(0)
+        self.timestamp = vehicle.timestamp
+        self.no_update_counter = 0
+        self.direction_radians = self.compute_direction(self.lat, self.lon)
+        self.vehicle_id = vehicle.vehicle_id
+        self.trip_id = vehicle.trip_id
+        self.block_id = (static_data.trip_to_block_id.get(vehicle.trip_id)
+                         if static_data else None)
+
+        # If for any reason the static data for a given vehicle arrives after
+        # the realtime data, update the shape_id.
+        if static_data:
+            shape_id = static_data.trip_to_shape_id.get(vehicle.trip_id)
+            if shape_id is not None:
+                self.shape_id = shape_id
+
+    @staticmethod
+    def compute_direction(lat: list[float], lon: list[float]) -> float | None:
+        if len(lat) < 2:
+            return None
+        # Find the first sufficiently distant point relative to the current
+        # position (lat[-1], lon[-1]) and compute the angle of that vector.
+        for i in reversed(range(len(lat) - 1)):
+            dist = latlon.haversine_distance_meters(
+                lat[-1], lon[-1], lat[i], lon[i])
+            if dist > DIRECTION_THRESHOLD_METERS:
+                angle = latlon.arrow_angle(lat[i], lon[i], lat[-1], lon[-1])
+                return angle
+        return None
+
+    def to_json_v0(self):
+        if self.direction_radians is not None:
+            deg = round(self.direction_radians * 180 / math.pi)
+        else:
+            deg = None
+        return {
+            'routeId': self.route_id,
+            'timestamp': self.timestamp,
+            'lat': self.lat[-TRAJECTORY_OUTPUT_LENGTH:],
+            'lon': self.lon[-TRAJECTORY_OUTPUT_LENGTH:],
+            'directionDegrees': deg,
+        }
+
+    @staticmethod
+    def to_compressed_json(
+        vehicles: list['Vehicle'],
+        ref: ReferenceSystem
+    ) -> dict:
+        """Return a list of vehicles in a structure-of-arrays JSON format with
+        compressed values."""
+
+        static = ref.static
+        L = TRAJECTORY_OUTPUT_LENGTH
+        compressed_lats = [static.compress_lats(v.lat[-L:]) for v in vehicles]
+        compressed_lons = [static.compress_lons(v.lon[-L:]) for v in vehicles]
+        degrees = [
+            round(v.direction_radians * 180 / math.pi)
+            if v.direction_radians is not None else None
+            for v in vehicles]
+        return {
+            'routeIds': [v.route_id for v in vehicles],
+            'shapeIds': [v.shape_id for v in vehicles],
+            'vehicleIds': [v.vehicle_id for v in vehicles],
+            'tripIds': [v.trip_id for v in vehicles],
+            'blockIds': [v.block_id for v in vehicles],
+            'timestamps': ref.compress_timestamps([v.timestamp for v in vehicles]),
+            'reportDelays': [v.report_delay for v in vehicles],
+            'compressedLats': compressed_lats,
+            'compressedLons': compressed_lons,
+            'directionDegrees': degrees,
+        }
+
+
+@dataclass
+class RealtimeState:
+    vehicles: dict[tuple[str | None, TripId], Vehicle]
+    timestamp: int
+    active_static_key: str | None
+    _last_feed_received_at: float | None = field(default=None, init=False, repr=False)
+
+    def update(
+        self,
+        feed: ParsedFeed,
+        active_static_snapshot: Optional['StaticDataSnapshot'],
+    ):
+        if feed.timestamp < self.timestamp:
+            # Historical replay or a feed clock reset starts a new observation.
+            self.vehicles.clear()
+        received_at = time.monotonic()
+        continuous_feed = (
+            0 <= feed.timestamp - self.timestamp
+            <= MAX_REPORT_OBSERVATION_GAP_SECONDS
+            and self._last_feed_received_at is not None
+            and 0 <= received_at - self._last_feed_received_at
+            <= MAX_REPORT_OBSERVATION_GAP_SECONDS)
+        self._last_feed_received_at = received_at
+        for vehicle in self.vehicles.values():
+            vehicle.no_update_counter += 1
+
+        static_data = (active_static_snapshot.static_data
+                       if active_static_snapshot else None)
+        for vehicle in feed.vehicles:
+            # Vehicles can share a trip. Keep their trails separate, while a
+            # new trip starts fresh route, shape and trajectory state. Without
+            # a vehicle ID, retain the existing per-trip identity.
+            key = (vehicle.vehicle_id, vehicle.trip_id)
+            v = self.vehicles.get(key)
+            if v is None:
+                v = Vehicle.from_parsed_vehicle(vehicle, static_data)
+                self.vehicles[key] = v
+            v.update(vehicle, static_data, feed.timestamp, continuous_feed)
+
+        # Remove vehicles not in last 30 feeds.
+        self.vehicles = {
+            k: v for k, v in self.vehicles.items()
+            if v.no_update_counter < 30
+        }
+
+        self.timestamp = feed.timestamp
+        self.active_static_key = (
+            active_static_snapshot.key if active_static_snapshot else None)
+
+    def to_json_v0(self):
+        # The old v0 protocol contains only the vehicles.
+        return [v.to_json_v0() for v in self.vehicles.values()
+                if v.no_update_counter == 0]
+
+    def to_json_v1(self):
+        ref = ReferenceSystem(
+            static=STATIC_REFERENCE_SYSTEM,
+            ref_timestamp=self.timestamp,
+        )
+        vehicles = [v for v in self.vehicles.values()
+                    if v.no_update_counter == 0]
+        return {
+            'vehicles': Vehicle.to_compressed_json(vehicles, ref),
+            'timestamp': self.timestamp,
+            'activeStaticKey': self.active_static_key,
+            # Backwards compatibility (there was supposed to be a version bump
+            # after renaming this field...)
+            'latestStaticKey': self.active_static_key,
+        }
+
+    def json_v1_to_json_v2(self, data: dict):
+        data = dict(data)
+        del data['latestStaticKey']
+        return data
+
+
+@dataclass
+class WsClient:
+    ws: simple_websocket.ws.Server
+    version: int
+
+    def __hash__(self):
+        return id(self)
+
+
+@dataclass
+class WsOutputMessageVariants:
+    version0: str
+    version1: str
+    version2: str
+
+    @staticmethod
+    def from_realtime_state(state: RealtimeState) -> 'WsOutputMessageVariants':
+        json_v1 = state.to_json_v1()
+        return WsOutputMessageVariants(
+            version0=compact_json(state.to_json_v0()),
+            version1=compact_json(json_v1),
+            version2=compact_json(state.json_v1_to_json_v2(json_v1)),
+        )
+
+    def for_version(self, version: int) -> str:
+        match version:
+            case 0:
+                return self.version0
+            case 1:
+                return self.version1
+            case 2:
+                return self.version2
+            case _:
+                return self.version2
+
+
+@dataclass
+class GtfsShape:
+    id: ShapeId
+    lats: list[float]
+    lons: list[float]
+
+    @staticmethod
+    def to_compressed_json(
+        shapes: list['GtfsShape'], ref: StaticReferenceSystem
+    ) -> dict:
+        return {
+            'ids': [shape.id for shape in shapes],
+            'compressedLats': [
+                ref.compress_lats(shape.lats) for shape in shapes],
+            'compressedLons': [ref.compress_lons(shape.lons) for shape in shapes],
+        }
+
+
+def _read_gtfs_rows(zip_file: zipfile.ZipFile, name: str) -> Iterator[dict[str, str]]:
+    with zip_file.open(name) as file:
+        yield from csv.DictReader(io.TextIOWrapper(file, encoding='utf-8-sig'))
+
+
+def _encode_deltas(values: Iterable[int]) -> list[int]:
+    previous = 0
+    deltas = []
+    for value in values:
+        deltas.append(value - previous)
+        previous = value
+    return deltas
+
+
+@dataclass
+class StaticData:
+    trip_to_shape_id: dict[TripId, ShapeId]
+    shapes: dict[ShapeId, GtfsShape]
+    route_ids: list[RouteId]
+    # TODO: Store and check ServiceId
+    calendar_dates: set[datetime.date]
+    stops: dict[str, tuple[float, float]] = field(default_factory=dict)
+    shape_stop_ids: dict[ShapeId, list[str]] = field(default_factory=dict)
+    trip_to_block_id: dict[TripId, str] = field(default_factory=dict)
+
+    @staticmethod
+    def from_gzipped_data(gzipped_data: bytes) -> 'StaticData':
+        return StaticData.from_zip_data(gzip.decompress(gzipped_data))
+
+    @staticmethod
+    def from_zip_data(raw_data: bytes) -> 'StaticData':
+        with zipfile.ZipFile(io.BytesIO(raw_data)) as zip_file:
+            trip_to_shape_id = {}
+            trip_to_block_id = {}
+            for row in _read_gtfs_rows(zip_file, 'trips.txt'):
+                trip_to_shape_id[row['trip_id']] = row['shape_id']
+                if row.get('block_id'):
+                    trip_to_block_id[row['trip_id']] = row['block_id']
+            shapes = StaticData._read_shapes(zip_file)
+            return StaticData(
+                trip_to_shape_id=trip_to_shape_id,
+                trip_to_block_id=trip_to_block_id,
+                shapes=shapes,
+                route_ids=StaticData._read_route_ids(zip_file),
+                calendar_dates=StaticData._read_calendar_dates(zip_file),
+                stops=StaticData._read_stops(zip_file),
+                shape_stop_ids=StaticData._read_shape_stop_ids(
+                    zip_file, trip_to_shape_id, set(shapes)),
+            )
+
+    @staticmethod
+    def _read_shapes(zip_file: zipfile.ZipFile) -> dict[ShapeId, GtfsShape]:
+        # GTFS shape points need not arrive in shape_pt_sequence order.
+        points: dict[ShapeId, list[tuple[int, float, float]]] = {}
+        for row in _read_gtfs_rows(zip_file, 'shapes.txt'):
+            points.setdefault(row['shape_id'], []).append((
+                int(row['shape_pt_sequence']),
+                float(row['shape_pt_lat']), float(row['shape_pt_lon'])))
+        shapes: dict[ShapeId, GtfsShape] = {}
+        for shape_id, shape_points in points.items():
+            shape_points.sort(key=lambda point: point[0])
+            shapes[shape_id] = GtfsShape(
+                id=shape_id,
+                lats=[lat for _, lat, _ in shape_points],
+                lons=[lon for _, _, lon in shape_points],
+            )
+        return shapes
+
+    @staticmethod
+    def _read_route_ids(zip_file: zipfile.ZipFile) -> list[RouteId]:
+        route_ids: list[RouteId] = []
+        for row in _read_gtfs_rows(zip_file, 'routes.txt'):
+            try:
+                route_ids.append(int(row['route_id']))
+            except ValueError:
+                logger.warning('Error parsing route_id: %s', row['route_id'])
+        return route_ids
+
+    @staticmethod
+    def _read_calendar_dates(zip_file: zipfile.ZipFile) -> set[datetime.date]:
+        dates: set[datetime.date] = set()
+        for row in _read_gtfs_rows(zip_file, 'calendar_dates.txt'):
+            try:
+                dates.add(datetime.datetime.strptime(row['date'], '%Y%m%d').date())
+            except ValueError as e:
+                logger.error('Error parsing calendar_dates.txt: %s', e)
+        return dates
+
+    @staticmethod
+    def _read_stops(zip_file: zipfile.ZipFile) -> dict[str, tuple[float, float]]:
+        return {
+            row['stop_id']: (float(row['stop_lat']), float(row['stop_lon']))
+            for row in _read_gtfs_rows(zip_file, 'stops.txt')
+            if row['stop_lat'] and row['stop_lon']
+        }
+
+    @staticmethod
+    def _read_shape_stop_ids(
+        zip_file: zipfile.ZipFile,
+        trip_to_shape_id: dict[TripId, ShapeId],
+        available_shapes: set[ShapeId],
+        *,
+        grouped: bool = True,
+    ) -> dict[ShapeId, list[str]]:
+        shape_stop_ids: dict[ShapeId, list[str]] = {}
+        ambiguous_shapes: set[ShapeId] = set()
+
+        def add_trip(trip_id: TripId, stop_sequence: Iterable[tuple[int, str]]):
+            shape_id = trip_to_shape_id[trip_id]
+            stop_ids = [stop_id for _, stop_id in sorted(stop_sequence)]
+            if shape_id in shape_stop_ids and shape_stop_ids[shape_id] != stop_ids:
+                ambiguous_shapes.add(shape_id)
+            else:
+                shape_stop_ids[shape_id] = stop_ids
+
+        with zip_file.open('stop_times.txt') as file:
+            # This file has millions of rows. Avoid a dictionary per row and,
+            # when trips are contiguous, retain only one trip's stops at a time.
+            # DictReader previously skipped empty rows; preserve that tolerance
+            # for both grouped parsing and the unordered fallback.
+            reader = (row for row in csv.reader(
+                io.TextIOWrapper(file, encoding='utf-8-sig')) if row)
+            header = next(reader)
+            trip_col, stop_col, sequence_col = (
+                header.index(name) for name in ('trip_id', 'stop_id', 'stop_sequence'))
+            if grouped:
+                seen: set[TripId] = set()
+                for trip_id, rows in groupby(reader, lambda row: row[trip_col]):
+                    if trip_id in seen:
+                        logger.info('Interleaved stop_times trips; using unordered parser')
+                        # GTFS does not require contiguous trips. Restart from
+                        # scratch rather than treating partial blocks as patterns.
+                        return StaticData._read_shape_stop_ids(
+                            zip_file, trip_to_shape_id, available_shapes, grouped=False)
+                    seen.add(trip_id)
+                    if trip_to_shape_id.get(trip_id) in available_shapes:
+                        add_trip(trip_id, ((int(row[sequence_col]), row[stop_col])
+                                          for row in rows))
+            else:
+                trip_stops: dict[TripId, list[tuple[int, str]]] = {}
+                for row in reader:
+                    trip_id = row[trip_col]
+                    if trip_to_shape_id.get(trip_id) in available_shapes:
+                        trip_stops.setdefault(trip_id, []).append(
+                            (int(row[sequence_col]), row[stop_col]))
+                for trip_id, stop_sequence in trip_stops.items():
+                    add_trip(trip_id, stop_sequence)
+
+        # The current feed has one stop sequence per shape. If that changes,
+        # keep drawing geometry, but do not guess which stops a trip serves.
+        for shape_id in ambiguous_shapes:
+            shape_stop_ids.pop(shape_id, None)
+        if ambiguous_shapes:
+            logger.warning('Omitting stops for %d shapes with multiple stop patterns',
+                           len(ambiguous_shapes))
+        return shape_stop_ids
+
+    def big_to_json(self, ref: StaticReferenceSystem) -> dict:
+        """Large data, loaded on demand."""
+        # No need to export the trip_id to the client.
+        # Assign indices in first-appearance order along the shapes. Nearby
+        # stops then tend to have nearby indices as well as coordinates.
+        stop_ids = list(dict.fromkeys(
+            stop_id for shape_id in self.shapes
+            for stop_id in self.shape_stop_ids.get(shape_id, [])
+            if stop_id in self.stops))
+        stop_indices = {stop_id: i for i, stop_id in enumerate(stop_ids)}
+        shapes = GtfsShape.to_compressed_json(list(self.shapes.values()), ref)
+        shapes['stopIndexDeltas'] = [
+            _encode_deltas(stop_indices[s]
+                           for s in self.shape_stop_ids.get(shape_id, [])
+                           if s in stop_indices)
+            for shape_id in self.shapes]
+        return {
+            'shapes': shapes,
+            'stops': {
+                'latDeltas': ref.compress_lats([self.stops[s][0] for s in stop_ids]),
+                'lonDeltas': ref.compress_lons([self.stops[s][1] for s in stop_ids]),
+            },
+        }
+
+    def small_to_json(self) -> dict:
+        """Small data that is loaded immediately when the page is loaded."""
+        return {
+            'routes': {
+                'ids': self.route_ids,
+            },
+        }
+
+
+@dataclass
+class StaticDataSnapshot:
+    key: str
+    static_data: StaticData
+    formatted_json_big: str
+    formatted_json_small: str
+
+
+def compact_json(json_data: dict | list) -> str:
+    """Compact JSON data by removing whitespace."""
+    return json.dumps(json_data, separators=(',', ':'))
+
+
+class GtfsServer:
+    MAX_RECENT_STATIC_SNAPSHOTS = 3
+
+    def __init__(self, fetcher_url: str):
+        self.update_lock = threading.Lock()
+        self.realtime_state = RealtimeState(
+            vehicles={}, timestamp=0, active_static_key=None)
+        self.fetcher_url = fetcher_url
+
+        # Note: in principle, we could use websocket_server, but it is not
+        # compatible with flask. In the future, we may get rid of flask
+        # altogether.
+        self.ws_clients: set[WsClient] = set()
+        self.ws_clients_lock = threading.Lock()
+        self.latest_message: WsOutputMessageVariants | None = None
+        self.news_cache = NewsCache()
+
+        self._send_time = 0
+        self._send_lock = threading.Lock()
+        self.recent_static_snapshots: list[StaticDataSnapshot] = []
+        self.last_realtime_update: float = 0
+        self.notifier = RateLimitedNotifier(cooldown=3600)
+        self._feedback_timestamps: list[float] = []
+        self._feedback_lock = threading.Lock()
+
+    def process_feed(
+        self,
+        raw_feed: gtfs_realtime_pb2.FeedMessage
+    ) -> tuple[ParsedFeed, WsOutputMessageVariants] | tuple[None, None]:
+        try:
+            feed = ParsedFeed.from_raw_feed(raw_feed)
+        except Exception as e:
+            logger.error(f"Error parsing feed: {e}")
+            return None, None
+        if feed is None:
+            return None, None
+
+        if os.environ.get('ZET_DEV') == '1':
+            # Occasionally age a position to exercise gray markers and recovery.
+            for vehicle in feed.vehicles:
+                if random.random() < 0.1:
+                    vehicle.timestamp -= random.randint(60, 900)
+
+        # Match the feed's date, including when replaying historical data.
+        feed_date = datetime.datetime.fromtimestamp(
+            feed.timestamp, ZoneInfo('Europe/Zagreb')).date()
+        with self.update_lock:
+            active_static_snapshot = None
+            for snapshot in self.recent_static_snapshots[::-1]:
+                if feed_date in snapshot.static_data.calendar_dates:
+                    active_static_snapshot = snapshot
+                    break
+            self.realtime_state.update(feed, active_static_snapshot)
+            message = WsOutputMessageVariants.from_realtime_state(
+                self.realtime_state)
+            self.latest_message = message
+        return feed, message
+
+    def update_feed_from_file(self, source):
+        raw_feed = gtfs_realtime_pb2.FeedMessage()
+        with open(source, "rb") as f:
+            raw_feed.ParseFromString(f.read())
+        self.process_feed(raw_feed)
+
+    def _process_realtime_data(self, data: dict):
+        raw_data = bytes.fromhex(data['gzipped_data'])
+        raw_feed = gtfs_realtime_pb2.FeedMessage()
+        raw_feed.ParseFromString(gzip.decompress(raw_data))
+        feed, message = self.process_feed(raw_feed)
+        if feed is None or message is None:
+            return
+        self.last_realtime_update = time.time()
+        date = datetime.datetime.now()
+        with self.ws_clients_lock:
+            num_clients = len(self.ws_clients)
+            send_time = self._send_time
+        print(f"{date} New vehicles: {len(feed.vehicles)}  "
+            f"Num clients: {num_clients}  "
+            f"Send time: {send_time:.3f}s  "
+            f"Message size: v0={len(message.version0)} "
+            f"v1={len(message.version1)}")
+        # Send updates to all connected clients
+        self._notify_clients(message)
+
+    def _process_static_data(self, data: dict):
+        logger.info("Processing static data.")
+        try:
+            raw_data = gzip.decompress(bytes.fromhex(data['gzipped_data']))
+            # Hash the ZIP itself: gzip headers may change across downloads.
+            # Keep this stable across restarts for the cacheable static URLs.
+            # A future response schema change must version the URL or key.
+            key = hashlib.sha256(raw_data).hexdigest()[:32]
+            with self.update_lock:
+                if any(s.key == key for s in self.recent_static_snapshots):
+                    return
+            static_data = StaticData.from_zip_data(raw_data)
+            json_data_big = static_data.big_to_json(STATIC_REFERENCE_SYSTEM)
+            json_data_small = static_data.small_to_json()
+            snapshot = StaticDataSnapshot(
+                key=key,
+                static_data=static_data,
+                formatted_json_big=compact_json(json_data_big),
+                formatted_json_small=compact_json(json_data_small),
+            )
+            with self.update_lock:
+                # Another caller may have loaded the same archive meanwhile.
+                if any(s.key == key for s in self.recent_static_snapshots):
+                    return
+                self.recent_static_snapshots.append(snapshot)
+                while (len(self.recent_static_snapshots) >
+                       self.MAX_RECENT_STATIC_SNAPSHOTS):
+                    self.recent_static_snapshots.pop(0)
+        except Exception as e:
+            logger.error(f"Error processing static data: {e}")
+
+    def _check_staleness(self):
+        if self.last_realtime_update == 0:
+            return
+        elapsed = time.time() - self.last_realtime_update
+        if elapsed > STALE_THRESHOLD:
+            self.notifier.try_send(
+                "Stale GTFS Data",
+                f"No realtime update for {int(elapsed)}s")
+
+    def _staleness_check_loop(self):
+        while True:
+            time.sleep(30)
+            self._check_staleness()
+
+    async def fetch_data_from_fetcher(self):
+        def process_message(fetcher_message):
+            data = json.loads(fetcher_message)
+            kind = data.get('kind')
+            try:
+                match kind:
+                    case 'realtime':
+                        self._process_realtime_data(data)
+                    case 'static':
+                        self._process_static_data(data)
+                    case _:
+                        logger.error(f"Unknown kind: {kind}")
+            except Exception as e:
+                logger.error(f"Error processing {kind} message: {e}")
+
+        backoff_time = 1
+        max_backoff_time = 4
+        while True:
+            try:
+                async with websockets.connect(
+                        self.fetcher_url, max_size=200*1024*1024) as websocket:
+                    # Reset backoff time on successful connection
+                    backoff_time = 1
+                    while True:
+                        message = await websocket.recv()
+                        process_message(message)
+            except Exception as e:
+                self._check_staleness()
+                logger.error(f"Connection error: {e}. "
+                             f"Reconnecting in {backoff_time} seconds...")
+                await asyncio.sleep(backoff_time)
+                backoff_time = min(max_backoff_time, backoff_time + 1)
+
+    def update_feed_continuously(self):
+        asyncio.run(self.fetch_data_from_fetcher())
+
+    def _notify_clients(self, message: WsOutputMessageVariants) -> None:
+        self._notify_message(lambda client: message.for_version(client.version))
+
+    def _notify_news_status(self) -> None:
+        schema_v1_message = self.news_cache.status_message(NEWS_SCHEMA_V1)
+        schema_v2_message = self.news_cache.status_message(NEWS_SCHEMA_V2)
+        self._notify_message(lambda client: (
+            schema_v2_message if client.version >= 4
+            else schema_v1_message if client.version >= 3
+            else None))
+
+    def _notify_message(
+            self,
+            message_for_client: Callable[[WsClient], str | None],
+    ) -> None:
+        dead_clients: set[WsClient] = set()
+        with self._send_lock:
+            with self.ws_clients_lock:
+                clients = list(self.ws_clients)
+            start_time = time.time()
+            for client in clients:
+                message = message_for_client(client)
+                if message is None:
+                    continue
+                try:
+                    client.ws.send(message)
+                except Exception:
+                    dead_clients.add(client)
+        with self.ws_clients_lock:
+            self.ws_clients -= dead_clients
+        self._send_time = time.time() - start_time
+
+    def update_news_continuously(self) -> None:
+        while True:
+            if self.news_cache.refresh():
+                self._notify_news_status()
+            time.sleep(NEWS_FETCH_INTERVAL_SECONDS)
+
+    def handle_big_static_data_request(self, key: str) -> tuple[str, int]:
+        for snapshot in self.recent_static_snapshots:
+            if snapshot.key == key:
+                return snapshot.formatted_json_big, 200
+        return "Static data not found", 404
+
+    def handle_small_static_data_request(self, key: str) -> tuple[str, int]:
+        for snapshot in self.recent_static_snapshots:
+            if snapshot.key == key:
+                return snapshot.formatted_json_small, 200
+        return "Static data not found", 404
+
+
+gtfs_server: GtfsServer | None = None
+
+
+def handle_websocket(
+    ws: simple_websocket.ws.Server,
+    version: int,
+    app_updates: bool = False,
+):
+    if gtfs_server is None:
+        raise Exception("gtfs_server is not initialized")
+    client = WsClient(ws=ws, version=version)
+    with gtfs_server.ws_clients_lock:
+        gtfs_server.ws_clients.add(client)
+    logger.info("Client connected. Number of clients: %d",
+                len(gtfs_server.ws_clients))
+    try:
+        frontend_release = release_message() if app_updates else None
+        with gtfs_server._send_lock:
+            if frontend_release is not None:
+                client.ws.send(frontend_release)
+            if gtfs_server.latest_message:
+                client.ws.send(gtfs_server.latest_message.for_version(version))
+            if version >= 3:
+                schema = (NEWS_SCHEMA_V2 if version >= 4
+                          else NEWS_SCHEMA_V1)
+                news_status = gtfs_server.news_cache.status_message(schema)
+                if news_status is not None:
+                    client.ws.send(news_status)
+        while True:
+            ws.receive()
+    except Exception:
+        pass
+    finally:
+        with gtfs_server.ws_clients_lock:
+            gtfs_server.ws_clients.discard(client)
+
+
+@sock.route('/ws')
+def websocket(ws: simple_websocket.ws.Server):
+    handle_websocket(ws, version=0)
+
+
+@sock.route('/ws-v1')
+def websocket_v1(ws: simple_websocket.ws.Server):
+    handle_websocket(ws, version=1)
+
+
+@sock.route('/ws-v2')
+def websocket_v2(ws: simple_websocket.ws.Server):
+    """v2 only removes the redundant duplicate backward-compatibility key
+    latestStaticKey."""
+    handle_websocket(ws, version=2)
+
+
+@sock.route('/ws-v3')
+def websocket_v3(ws: simple_websocket.ws.Server):
+    """v3 keeps bare realtime messages and adds separate typed messages."""
+    handle_websocket(ws, version=3)
+
+
+@sock.route('/ws-v4')
+def websocket_v4(ws: simple_websocket.ws.Server):
+    """v4 opts into news schema v2."""
+    # Old cached clients do not understand app-version messages.
+    handle_websocket(ws, version=4, app_updates=request.args.get('appUpdates') == '1')
+
+
+@app.route('/news')
+def news():
+    if gtfs_server is None:
+        raise Exception("gtfs_server is not initialized")
+    raw_schema = request.args.get('schema')
+    if raw_schema is None or raw_schema == str(NEWS_SCHEMA_V1):
+        schema = NEWS_SCHEMA_V1
+    elif raw_schema == str(NEWS_SCHEMA_V2):
+        schema = NEWS_SCHEMA_V2
+    else:
+        return {'error': 'Unsupported news schema'}, 400
+    snapshot = gtfs_server.news_cache.snapshot(schema)
+    if snapshot is None:
+        return '', 204
+    version, message = snapshot
+    if request.if_none_match.contains(version):
+        response = Response(status=304)
+    else:
+        response = Response(message, mimetype='application/json')
+    response.set_etag(version)
+    # Store the response, but revalidate it whenever the user opens news.
+    response.headers['Cache-Control'] = 'private, no-cache'
+    return response
+
+
+@app.route('/static/<key>')
+@app.route('/static/big/v1/<key>')
+def static_data_big(key: str):
+    if gtfs_server is None:
+        raise Exception("gtfs_server is not initialized")
+    json_data, status = gtfs_server.handle_big_static_data_request(key)
+    cache_control = 'public, max-age=5184000' if status == 200 else 'no-cache'
+    return json_data, status, {'Cache-Control': cache_control}
+
+
+@app.route('/static/small/v0/<key>')
+def static_data_small(key: str):
+    if gtfs_server is None:
+        raise Exception("gtfs_server is not initialized")
+    json_data, status = gtfs_server.handle_small_static_data_request(key)
+    cache_control = 'public, max-age=5184000' if status == 200 else 'no-cache'
+    return json_data, status, {'Cache-Control': cache_control}
+
+
+FEEDBACK_RATE_LIMIT = 100  # max submissions per hour
+FEEDBACK_RATE_WINDOW = 3600  # seconds
+FEEDBACK_MESSAGE_MAX_LENGTH = 1000
+MAP_ERROR_MESSAGE_MAX_LENGTH = 20_000
+
+
+@app.route('/api/feedback', methods=['POST'])
+def feedback():
+    if gtfs_server is None:
+        return jsonify({"error": "Server not initialized"}), 500
+
+    data = request.get_json(silent=True)
+    if (not data
+            or not isinstance(data, dict)
+            or not isinstance(data.get('message'), str)):
+        return jsonify({"error": "Neispravan zahtjev."}), 400
+
+    kind = data.get('kind', 'feedback')
+    if kind not in ('feedback', 'map-error'):
+        return jsonify({"error": "Neispravan zahtjev."}), 400
+    max_length = (MAP_ERROR_MESSAGE_MAX_LENGTH if kind == 'map-error'
+                  else FEEDBACK_MESSAGE_MAX_LENGTH)
+
+    message = data['message'].strip()
+    if not message:
+        return jsonify({"error": "Poruka ne smije biti prazna."}), 400
+    if len(message) > max_length:
+        return jsonify({"error": "Poruka je predugačka."}), 400
+
+    now = time.time()
+    with gtfs_server._feedback_lock:
+        # Prune old timestamps.
+        cutoff = now - FEEDBACK_RATE_WINDOW
+        gtfs_server._feedback_timestamps = [
+            t for t in gtfs_server._feedback_timestamps if t > cutoff]
+        if len(gtfs_server._feedback_timestamps) >= FEEDBACK_RATE_LIMIT:
+            return jsonify({
+                "error": "Previše je poruka primljeno. Pokušajte kasnije."}), 429
+        gtfs_server._feedback_timestamps.append(now)
+
+    email = data.get('email', '')
+    if not isinstance(email, str):
+        email = ''
+    email = email.strip()[:100]
+
+    email_body = message
+    if email:
+        email_body += f"\n\nE-mail: {email}"
+    random_id = os.urandom(3).hex()
+    if not send_feedback_email(f"[{random_id}] ZET Feedback", email_body):
+        return jsonify({"error": "Greška pri slanju. Pokušajte kasnije."}), 500
+    return jsonify({"status": "ok", "message": "Hvala na poruci!"}), 200
+
+
+def create_parser():
+    parser = argparse.ArgumentParser(
+        description='GTFS Realtime Coordinate Server')
+    add = parser.add_argument
+    add('--file', help='Path to the GTFS protobuf file')
+    add('--url', help='URL to fetch the GTFS protobuf file',
+        default='https://www.zet.hr/gtfs-rt-protobuf')
+    add('--fetcher-url', type=str, default='ws://localhost:8765',
+        help='URL of the fetcher server (default: ws://localhost:8765)')
+    add('--port', type=int, default=5000,
+        help='Port to run the server on (default: 5000)')
+    add('--host', default='localhost',
+        help='Host to run the server on (default: localhost)')
+    return parser
+
+
+def main():
+    parser = create_parser()
+    args = parser.parse_args()
+
+    global gtfs_server
+    gtfs_server = GtfsServer(fetcher_url=args.fetcher_url)
+
+    # If using URL, start background thread for updates
+    if args.url:
+        update_thread = threading.Thread(
+            target=gtfs_server.update_feed_continuously, daemon=True)
+        update_thread.start()
+        staleness_thread = threading.Thread(
+            target=gtfs_server._staleness_check_loop, daemon=True)
+        staleness_thread.start()
+    else:
+        gtfs_server.update_feed_from_file(args.file)
+    news_thread = threading.Thread(
+        target=gtfs_server.update_news_continuously, daemon=True)
+    news_thread.start()
+
+    app.run(port=args.port, host=args.host)
+
+
+if __name__ == '__main__':
+    main()

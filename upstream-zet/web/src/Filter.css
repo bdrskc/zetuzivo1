@@ -1,0 +1,163 @@
+body {
+  --tram-color: hsl(207, 90%, 54%);
+  --tram-color-hover: hsl(207, 90%, 44%);
+  --bus-color: hsl(212, 80%, 42%);
+  --bus-color-hover: hsl(212, 80%, 32%);
+}
+
+.filter-header {
+  display: flex;
+  gap: 16px;
+  padding: 8px 12px;
+  border-bottom: 1px solid #e0e0e0;
+  background: #f8f9fa;
+  flex-shrink: 0;
+}
+
+.filter-category {
+  display: flex;
+  align-items: center;
+}
+
+.filter-category-label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+  font-size: 14px;
+  font-weight: 500;
+  color: #333;
+}
+
+.filter-tri-checkbox {
+  width: 16px;
+  height: 16px;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.filter-category-text {
+  user-select: none;
+}
+
+.filter-reset-button {
+  margin-left: auto;
+  padding: 6px 12px;
+  background: #6c757d;
+  color: white;
+  border: none;
+  border-radius: 4px;
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+}
+
+.filter-reset-button:hover:not(:disabled) {
+  background: #5a6268;
+}
+
+.filter-reset-button:disabled {
+  background: #adb5bd;
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
+.filter-list {
+  columns: 27px;
+  column-gap: 4px;
+  padding: 4px;
+  max-height: 40vh;
+  overflow-y: auto;
+  max-width: 700px;
+}
+
+.filter-route {
+  width: 22px;
+  break-inside: avoid;
+  display: inline-block;
+}
+
+.filter-label {
+  display: block;
+  padding: 0;
+  margin: 0;
+  width: 100%;
+}
+
+.filter-checkbox {
+  display: none; /* Hide the actual checkbox */
+}
+
+.filter-route-id {
+  display: block;
+  width: 100%;
+  padding: 2px 4px;
+  text-align: center;
+  font-family: Arial, sans-serif;
+  font-size: 13px;
+  font-weight: bold;
+  color: #191b1d;
+  border-radius: 4px;
+  cursor: pointer;
+  user-select: none;
+  overflow: hidden;
+  white-space: nowrap;
+}
+
+.filter-checkbox:checked + .filter-route-id.tram {
+  background: var(--tram-color);
+  border-color: var(--tram-color);
+  color: white;
+  text-shadow: 0 0 2px rgba(0, 0, 0, 0.5);
+}
+
+.filter-checkbox:checked + .filter-route-id.bus {
+  background: var(--bus-color);
+  border-color: var(--bus-color);
+  color: white;
+  text-shadow: 0 0 2px rgba(0, 0, 0, 0.5);
+}
+
+@media (hover: hover) {
+  .filter-checkbox + .filter-route-id:hover {
+    background: #e9ecef;
+    border-color: #adb5bd;
+  }
+
+  .filter-checkbox:checked + .filter-route-id.tram:hover {
+    background: var(--tram-color-hover);
+    border-color: var(--tram-color-hover);
+  }
+
+  .filter-checkbox:checked + .filter-route-id.bus:hover {
+    background: var(--bus-color-hover);
+    border-color: var(--bus-color-hover);
+  }
+}
+
+.filter-ctrl {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+}
+
+.filter-ctrl .no-markers {
+  animation: filter-warning-pulse 2s infinite;
+}
+
+.filter-ctrl .active:not(.no-markers) {
+  background: hsl(122deg 100% 87%);
+}
+
+@keyframes filter-warning-pulse {
+  0% {
+    background: white;
+  }
+  50% {
+    background: #ff9e9e;
+  }
+  100% {
+    background: white;
+  }
+}

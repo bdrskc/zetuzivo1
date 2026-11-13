@@ -1,0 +1,6 @@
+*.sqlite3
+/app_news.json
+/venv
+BUILD
+__pycache__
+node_modules

@@ -1,0 +1,111 @@
+import { useState } from "react";
+import { getHttpUrl } from "./url";
+import "./Feedback.css";
+
+type FeedbackKind = "feedback" | "map-error";
+
+export function FeedbackForm({
+  initialMessage = "",
+  title = "Povratna informacija",
+  kind = "feedback",
+}: {
+  initialMessage?: string;
+  title?: string;
+  kind?: FeedbackKind;
+}) {
+  const maxMessageLength = kind === "map-error" ? 20_000 : 1000;
+  const [message, setMessage] = useState(initialMessage);
+  const [email, setEmail] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+  const [status, setStatus] = useState<{
+    type: "success" | "error";
+    text: string;
+  } | null>(null);
+
+  const handleSubmit = async () => {
+    if (!message.trim() || message.length > maxMessageLength || submitting)
+      return;
+
+    setSubmitting(true);
+    setStatus(null);
+
+    const body: { message: string; email?: string; kind: FeedbackKind } = {
+      message: message.trim(),
+      kind,
+    };
+    if (email.trim()) {
+      body.email = email.trim();
+    }
+
+    try {
+      const response = await fetch(getHttpUrl("api/feedback"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      const data = await response.json();
+
+      if (response.ok) {
+        setStatus({
+          type: "success",
+          text: data.message || "Hvala na poruci!",
+        });
+        setMessage("");
+        setEmail("");
+      } else {
+        setStatus({
+          type: "error",
+          text: data.error || "Greška pri slanju.",
+        });
+      }
+    } catch {
+      setStatus({ type: "error", text: "Greška pri slanju." });
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <div className="feedback-form">
+      <h4>{title}</h4>
+      {status && (
+        <div className={`feedback-status feedback-status-${status.type}`}>
+          {status.text}
+        </div>
+      )}
+      <textarea
+        className="feedback-textarea"
+        aria-label="Poruka"
+        placeholder="Vaša poruka..."
+        value={message}
+        onChange={(e) => setMessage(e.target.value)}
+        maxLength={maxMessageLength}
+        disabled={submitting}
+      />
+      <input
+        className="feedback-email"
+        type="email"
+        aria-label="E-mail (da Vam se po potrebi mogu javiti)"
+        placeholder="E-mail (da Vam se po potrebi mogu javiti)"
+        value={email}
+        onChange={(e) => setEmail(e.target.value)}
+        maxLength={100}
+        disabled={submitting}
+      />
+      <div className="feedback-footer">
+        <span className="feedback-char-count">
+          {message.length}/{maxMessageLength}
+        </span>
+        <button
+          className="feedback-submit"
+          onClick={handleSubmit}
+          disabled={
+            !message.trim() || message.length > maxMessageLength || submitting
+          }
+        >
+          {submitting ? "Slanje..." : "Pošalji"}
+        </button>
+      </div>
+    </div>
+  );
+}
