@@ -1,0 +1,17 @@
+# Render Blueprint. Put this file in the repo root, next to Dockerfile.
+# Dashboard: New > Blueprint > connect the GitHub repo.
+services:
+  - type: web
+    name: zet-uzivo
+    runtime: docker
+    plan: free
+    region: frankfurt
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /
+    autoDeployTrigger: commit
+    envVars:
+      - key: VOZLINIA_HOST
+        value: 0.0.0.0
+      - key: PYTHONUNBUFFERED
+        value: "1"
