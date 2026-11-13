@@ -1,0 +1,32 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "framework": "vite",
+  "buildCommand": "npm run build",
+  "outputDirectory": "dist",
+  "rewrites": [
+    {
+      "source": "/ws/:path*",
+      "destination": "https://BACKEND_HOST/ws/:path*"
+    },
+    {
+      "source": "/static/:path*",
+      "destination": "https://BACKEND_HOST/static/:path*"
+    },
+    {
+      "source": "/news",
+      "destination": "https://BACKEND_HOST/news"
+    },
+    {
+      "source": "/news/:path*",
+      "destination": "https://BACKEND_HOST/news/:path*"
+    },
+    {
+      "source": "/api/:path*",
+      "destination": "https://BACKEND_HOST/api/:path*"
+    },
+    {
+      "source": "/(.*)",
+      "destination": "/index.html"
+    }
+  ]
+}
