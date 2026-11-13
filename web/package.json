@@ -1,26 +1,9 @@
 {
   "name": "zet-uzivo",
-  "version": "0.1.0",
   "private": true,
-  "description": "ZET uživo - neslužbena karta položaja ZET tramvaja i autobusa uživo",
-  "type": "module",
+  "description": "ZET uživo — root package.json so Vercel finds a Node project",
   "scripts": {
-    "dev": "vite",
-    "build": "vite build && node build-version.mjs",
-    "preview": "vite preview",
-    "test:anim": "node scripts/test-animation.ts",
-    "test:eta": "node scripts/test-eta.ts"
-  },
-  "dependencies": {
-    "maplibre-gl": "^5.1.1",
-    "react": "^19.0.0",
-    "react-dom": "^19.0.0"
-  },
-  "devDependencies": {
-    "@types/react": "^19.0.10",
-    "@types/react-dom": "^19.0.4",
-    "@vitejs/plugin-react": "^4.3.4",
-    "typescript": "^5.7.3",
-    "vite": "^6.1.0"
+    "build": "cd web && npm run build",
+    "dev": "cd web && npm run dev"
   }
 }

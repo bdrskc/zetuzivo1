@@ -1,0 +1,33 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "framework": "vite",
+  "installCommand": "cd web && npm install",
+  "buildCommand": "cd web && npm run build",
+  "outputDirectory": "web/dist",
+  "rewrites": [
+    {
+      "source": "/ws/:path*",
+      "destination": "https://BACKEND_HOST/ws/:path*"
+    },
+    {
+      "source": "/static/:path*",
+      "destination": "https://BACKEND_HOST/static/:path*"
+    },
+    {
+      "source": "/news",
+      "destination": "https://BACKEND_HOST/news"
+    },
+    {
+      "source": "/news/:path*",
+      "destination": "https://BACKEND_HOST/news/:path*"
+    },
+    {
+      "source": "/api/:path*",
+      "destination": "https://BACKEND_HOST/api/:path*"
+    },
+    {
+      "source": "/(.*)",
+      "destination": "/index.html"
+    }
+  ]
+}
